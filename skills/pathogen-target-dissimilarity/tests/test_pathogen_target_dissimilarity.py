@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from homology_search import (
     HomologyHit,
     best_hit_per_query,
+    coverage_from_spans,
+    merge_spans,
     parse_tabular_hits,
     read_fasta,
     read_fasta_with_headers,
@@ -91,6 +93,75 @@ class TestParseTabularHits:
         path.write_text("q1\ts1\t38.5\n")
         with pytest.raises(SystemExit):
             parse_tabular_hits(path)
+
+
+class TestSpanCoverage:
+    """Coverage is the whole aligned fraction of the query, not one segment of it."""
+
+    def test_single_span(self):
+        assert merge_spans([(1, 10)]) == 10
+
+    def test_disjoint_spans_add(self):
+        assert merge_spans([(1, 10), (21, 30)]) == 20
+
+    def test_overlapping_spans_counted_once(self):
+        assert merge_spans([(1, 10), (5, 15)]) == 15
+
+    def test_adjacent_spans_merge(self):
+        assert merge_spans([(1, 10), (11, 20)]) == 20
+
+    def test_reversed_pair_is_normalised(self):
+        assert merge_spans([(10, 1)]) == 10
+
+    def test_empty(self):
+        assert merge_spans([]) == 0
+
+    def test_coverage_sums_every_segment(self):
+        # Four domains of 100 each across a 1000-residue query: 40%, not 10%.
+        spans = [(1, 100), (201, 300), (401, 500), (601, 700)]
+        assert coverage_from_spans(spans, 1000) == 40.0
+
+    def test_coverage_needs_positive_length(self):
+        assert coverage_from_spans([(1, 10)], 0) is None
+
+
+class TestMultiHspCoverage:
+    """outfmt 6 writes one row per HSP; a true orthologue often spans several."""
+
+    def test_hsps_of_one_pair_are_merged(self, tmp_path):
+        path = tmp_path / "hits.tsv"
+        # Two HSPs, 300 residues each, on a 1000-residue query: one hit at 60%.
+        path.write_text(
+            "q1\ts1\t40.0\t300\t0\t0\t1\t300\t1\t300\t1e-90\t320.0\t1000\n"
+            "q1\ts1\t30.0\t300\t0\t0\t501\t800\t501\t800\t1e-40\t150.0\t1000\n"
+        )
+        hits = parse_tabular_hits(path)
+        assert len(hits) == 1
+        assert hits[0].coverage_pct == 60.0
+        assert hits[0].evalue == 1e-90
+        assert hits[0].identity_pct == 35.0
+
+    def test_distinct_subjects_stay_separate(self, tmp_path):
+        path = tmp_path / "hits.tsv"
+        path.write_text(
+            "q1\ts1\t40.0\t100\t0\t0\t1\t100\t1\t100\t1e-20\t90.0\t500\n"
+            "q1\ts2\t40.0\t100\t0\t0\t1\t100\t1\t100\t1e-20\t90.0\t500\n"
+        )
+        assert len(parse_tabular_hits(path)) == 2
+
+    def test_multi_hsp_orthologue_survives_the_coverage_filter(self, tmp_path):
+        """The regression: four 12% HSPs are a 48% orthologue, not four coincidences."""
+        from homology_search import filter_by_coverage
+
+        path = tmp_path / "hits.tsv"
+        rows = "".join(
+            f"q1\ts1\t45.0\t120\t0\t0\t{s}\t{s+119}\t{s}\t{s+119}\t1e-92\t300.0\t1000\n"
+            for s in (1, 201, 401, 601)
+        )
+        path.write_text(rows)
+        hits = parse_tabular_hits(path)
+        assert hits[0].coverage_pct == 48.0
+        assert filter_by_coverage(hits, 40.0) == hits
 
 
 class TestBestHitPerQuery:

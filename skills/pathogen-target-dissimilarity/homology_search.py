@@ -151,11 +151,16 @@ def parse_tabular_hits(path: Path | str) -> list[HomologyHit]:
     thirteenth column is read as query length and used for coverage, which is
     what `--outfmt 6 ... qlen` produces.
 
+    Rows are grouped by query-subject pair, because outfmt 6 writes one row per
+    HSP and a pair of true orthologues routinely aligns as several. Coverage is
+    measured over the union of that pair's HSPs, identity is averaged across
+    them weighted by aligned length, and the pair keeps its best e-value.
+
     Args:
         path: Path to the tabular file.
 
     Returns:
-        List of hits in file order.
+        One hit per query-subject pair, in order of first appearance.
 
     Raises:
         SystemExit: If the file is missing or any data line has too few
@@ -166,7 +171,7 @@ def parse_tabular_hits(path: Path | str) -> list[HomologyHit]:
     path = Path(path)
     if not path.exists():
         raise SystemExit(f"Hits file not found: {path}")
-    hits: list[HomologyHit] = []
+    grouped: dict[tuple[str, str], dict] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip() or line.startswith("#"):
             continue
@@ -177,23 +182,100 @@ def parse_tabular_hits(path: Path | str) -> list[HomologyHit]:
                 f"tab-separated columns (BLAST/DIAMOND outfmt 6), found {len(fields)}. "
                 "Re-export the file rather than letting columns be inferred."
             )
-        coverage = None
-        if len(fields) >= 13:
-            coverage = coverage_from_span(fields[6], fields[7], fields[12])
+        key = (fields[0], fields[1])
+        record = grouped.setdefault(
+            key,
+            {"spans": [], "query_length": None, "identity_sum": 0.0, "length_sum": 0.0, "evalue": None},
+        )
+        try:
+            record["spans"].append((int(fields[6]), int(fields[7])))
+        except ValueError:
+            pass
+        if len(fields) >= 13 and record["query_length"] is None:
+            try:
+                record["query_length"] = int(fields[12])
+            except ValueError:
+                record["query_length"] = None
+        try:
+            aligned = float(fields[3])
+        except ValueError:
+            aligned = 0.0
+        record["identity_sum"] += float(fields[2]) * aligned
+        record["length_sum"] += aligned
+        evalue = float(fields[10])
+        if record["evalue"] is None or evalue < record["evalue"]:
+            record["evalue"] = evalue
+
+    hits: list[HomologyHit] = []
+    for (query_id, subject_id), record in grouped.items():
+        query_length = record["query_length"]
+        coverage = (
+            coverage_from_spans(record["spans"], query_length)
+            if query_length is not None
+            else None
+        )
+        identity = (
+            round(record["identity_sum"] / record["length_sum"], 1) if record["length_sum"] else 0.0
+        )
         hits.append(
             HomologyHit(
-                query_id=fields[0],
-                subject_id=fields[1],
-                identity_pct=float(fields[2]),
+                query_id=query_id,
+                subject_id=subject_id,
+                identity_pct=identity,
                 coverage_pct=coverage,
-                evalue=float(fields[10]),
+                evalue=record["evalue"],
             )
         )
     return hits
 
 
+def merge_spans(spans: list[tuple[int, int]]) -> int:
+    """Total length of a set of 1-based inclusive intervals, overlaps counted once.
+
+    Args:
+        spans: (start, end) pairs on the query; order within a pair is
+            normalised, so a reversed pair is handled.
+
+    Returns:
+        Number of distinct query positions the intervals cover.
+    """
+    if not spans:
+        return 0
+    ordered = sorted((min(a, b), max(a, b)) for a, b in spans)
+    total = 0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end + 1:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start + 1
+            current_start, current_end = start, end
+    return total + current_end - current_start + 1
+
+
+def coverage_from_spans(spans: list[tuple[int, int]], query_length: int) -> float | None:
+    """Query coverage from every aligned segment, not just the strongest one.
+
+    Coverage is compared downstream against a whole-protein threshold, so it
+    has to be measured over the whole protein. Scoring a single segment against
+    that threshold understates coverage by however many other segments the
+    alignment has, which discards exactly the long multi-domain orthologues the
+    threshold is meant to keep.
+
+    Args:
+        spans: Aligned (start, end) segments on the query, 1-based inclusive.
+        query_length: Total query length.
+
+    Returns:
+        Percent of the query covered, or None if the length is not positive.
+    """
+    if query_length <= 0:
+        return None
+    return round(100.0 * merge_spans(spans) / query_length, 1)
+
+
 def coverage_from_span(start: str, end: str, query_length: str) -> float | None:
-    """Compute query coverage from alignment span and query length.
+    """Compute query coverage from a single alignment span and query length.
 
     Args:
         start: Alignment start on the query, 1-based.
@@ -205,13 +287,11 @@ def coverage_from_span(start: str, end: str, query_length: str) -> float | None:
         is zero.
     """
     try:
-        span = abs(int(end) - int(start)) + 1
+        spans = [(int(start), int(end))]
         total = int(query_length)
     except ValueError:
         return None
-    if total <= 0:
-        return None
-    return round(100.0 * span / total, 1)
+    return coverage_from_spans(spans, total)
 
 
 def best_hit_per_query(hits: list[HomologyHit]) -> dict[str, HomologyHit]:
@@ -320,11 +400,13 @@ def search_pyhmmer(
         for hit in top_hits:
             if hit.evalue > evalue_threshold:
                 continue
-            domain = hit.best_domain
-            alignment = domain.alignment
-            identity = alignment_identity(alignment.hmm_sequence, alignment.target_sequence)
-            span = abs(alignment.hmm_to - alignment.hmm_from) + 1
-            coverage = round(100.0 * span / lengths[query_id], 1) if lengths[query_id] else None
+            domains = list(hit.domains.included) or [hit.best_domain]
+            spans = [(domain.alignment.hmm_from, domain.alignment.hmm_to) for domain in domains]
+            coverage = coverage_from_spans(spans, lengths[query_id])
+            identity = alignment_identity(
+                "".join(domain.alignment.hmm_sequence for domain in domains),
+                "".join(domain.alignment.target_sequence for domain in domains),
+            )
             hits.append(
                 HomologyHit(
                     query_id=query_id,
@@ -344,6 +426,11 @@ def filter_by_coverage(hits: list[HomologyHit], min_coverage: float) -> list[Hom
     orthologue, and treating it as one wrongly disqualifies a target. Hits
     with unknown coverage are kept, since absence of the field is not
     evidence of a short alignment.
+
+    Coverage must be the total aligned fraction of the query, summed over every
+    aligned segment; `coverage_from_spans` is what produces it. Passing a single
+    segment's coverage here reads a multi-domain orthologue as a domain-level
+    coincidence and lets it through as a clean target.
 
     Args:
         hits: Hits to filter.
